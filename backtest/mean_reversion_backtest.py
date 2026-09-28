@@ -1,117 +1,173 @@
 #!/usr/bin/env python3
 """
-Mean Reversion Stock Backtester
-Bollinger Bands mean reversion strategy on historical stock data.
+Mean Reversion Backtester (Bollinger Bands)
+
+Buys when the close crosses below the lower band, sells when it crosses above
+the upper band. Signals are generated on the close and filled at the NEXT
+day's open, with a per-trade cost applied to model spread and slippage.
 """
 
-import yfinance as yf
+import argparse
+import os
+
+import numpy as np
 import pandas as pd
+import yfinance as yf
+
+TRADING_DAYS = 252
 
 
 class MeanReversionBacktester:
-    def __init__(self, ticker, start_date, end_date, sma_period=20, std_dev=2, initial_cash=10000):
+    def __init__(self, ticker, start_date, end_date, sma_period=20,
+                 std_dev=2.0, initial_cash=10000, cost_bps=5):
         self.ticker = ticker
         self.start_date = start_date
         self.end_date = end_date
         self.sma_period = sma_period
         self.std_dev = std_dev
         self.initial_cash = initial_cash
-        self.cash = initial_cash
-        self.shares = 0
-        self.trades = []
+        self.cost_rate = cost_bps / 10_000
+        self.cost_bps = cost_bps
         self.df = None
+        self.trades = []
 
     def fetch_data(self):
-        print(f"Fetching data for {self.ticker} from {self.start_date} to {self.end_date}...")
-        self.df = yf.download(self.ticker, start=self.start_date, end=self.end_date, progress=False)
-        if isinstance(self.df.columns, pd.MultiIndex):
-            self.df.columns = self.df.columns.get_level_values(0)
-        if self.df.empty:
+        print(f"Fetching {self.ticker} from {self.start_date} to {self.end_date}...")
+        df = yf.download(self.ticker, start=self.start_date, end=self.end_date,
+                         progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if df.empty:
             raise ValueError(f"No data found for {self.ticker}")
-        print(f"Downloaded {len(self.df)} days of data.")
+        self.df = df
+        print(f"Downloaded {len(df)} trading days.")
 
     def calculate_indicators(self):
-        self.df['SMA'] = self.df['Close'].rolling(window=self.sma_period).mean()
-        self.df['STD'] = self.df['Close'].rolling(window=self.sma_period).std()
-        self.df['Upper_Band'] = self.df['SMA'] + (self.df['STD'] * self.std_dev)
-        self.df['Lower_Band'] = self.df['SMA'] - (self.df['STD'] * self.std_dev)
+        close = self.df["Close"]
+        self.df["SMA"] = close.rolling(self.sma_period).mean()
+        self.df["STD"] = close.rolling(self.sma_period).std()
+        self.df["Upper"] = self.df["SMA"] + self.std_dev * self.df["STD"]
+        self.df["Lower"] = self.df["SMA"] - self.std_dev * self.df["STD"]
 
     def generate_signals(self):
-        self.df['Signal'] = 0
-        for i in range(self.sma_period, len(self.df)):
-            if self.df['Close'].iloc[i] <= self.df['Lower_Band'].iloc[i] and self.df['Close'].iloc[i-1] > self.df['Lower_Band'].iloc[i-1]:
-                self.df.loc[self.df.index[i], 'Signal'] = 1
-            elif self.df['Close'].iloc[i] >= self.df['Upper_Band'].iloc[i] and self.df['Close'].iloc[i-1] < self.df['Upper_Band'].iloc[i-1]:
-                self.df.loc[self.df.index[i], 'Signal'] = -1
+        close, lower, upper = self.df["Close"], self.df["Lower"], self.df["Upper"]
+        crossed_below = (close <= lower) & (close.shift(1) > lower.shift(1))
+        crossed_above = (close >= upper) & (close.shift(1) < upper.shift(1))
+        self.df["Signal"] = 0
+        self.df.loc[crossed_below, "Signal"] = 1
+        self.df.loc[crossed_above, "Signal"] = -1
+
+    def _close_trade(self, entry, exit_date, exit_price):
+        pnl = (exit_price - entry["entry_price"]) * entry["shares"]
+        self.trades.append({
+            "entry_date": entry["entry_date"],
+            "exit_date": exit_date,
+            "entry_price": round(entry["entry_price"], 4),
+            "exit_price": round(exit_price, 4),
+            "shares": entry["shares"],
+            "pnl": round(pnl, 2),
+            "return_pct": round((exit_price / entry["entry_price"] - 1) * 100, 2),
+        })
 
     def backtest(self):
-        print("\nRunning backtest...")
-        for i in range(len(self.df)):
-            date = self.df.index[i]
-            close_price = self.df['Close'].iloc[i]
-            signal = self.df['Signal'].iloc[i]
-            if signal == 1 and self.cash > 0:
-                shares_to_buy = int(self.cash / close_price)
-                if shares_to_buy > 0:
-                    cost = shares_to_buy * close_price
-                    self.shares += shares_to_buy
-                    self.cash -= cost
-                    self.trades.append({'Date': date, 'Type': 'BUY', 'Price': close_price, 'Shares': shares_to_buy, 'Amount': cost})
-            elif signal == -1 and self.shares > 0:
-                proceeds = self.shares * close_price
-                self.cash += proceeds
-                self.trades.append({'Date': date, 'Type': 'SELL', 'Price': close_price, 'Shares': self.shares, 'Amount': proceeds})
-                self.shares = 0
-        if self.shares > 0:
-            final_price = self.df['Close'].iloc[-1]
-            proceeds = self.shares * final_price
-            self.cash += proceeds
-            self.trades.append({'Date': self.df.index[-1], 'Type': 'SELL (EOD)', 'Price': final_price, 'Shares': self.shares, 'Amount': proceeds})
-            self.shares = 0
+        df = self.df
+        cash, shares, entry = float(self.initial_cash), 0, None
+        equity = []
+
+        for i in range(len(df)):
+            if i > 0:
+                prev_signal = df["Signal"].iloc[i - 1]
+                open_price = df["Open"].iloc[i]
+                date = df.index[i]
+
+                if prev_signal == 1 and shares == 0:
+                    buy_price = open_price * (1 + self.cost_rate)
+                    qty = int(cash // buy_price)
+                    if qty > 0:
+                        cash -= qty * buy_price
+                        shares = qty
+                        entry = {"entry_date": date, "entry_price": buy_price, "shares": qty}
+                elif prev_signal == -1 and shares > 0:
+                    sell_price = open_price * (1 - self.cost_rate)
+                    cash += shares * sell_price
+                    self._close_trade(entry, date, sell_price)
+                    shares, entry = 0, None
+
+            equity.append(cash + shares * df["Close"].iloc[i])
+
+        # Close any open position at the final close
+        if shares > 0:
+            sell_price = df["Close"].iloc[-1] * (1 - self.cost_rate)
+            cash += shares * sell_price
+            self._close_trade(entry, df.index[-1], sell_price)
+            equity[-1] = cash
+
+        df["Equity"] = equity
+
+    @staticmethod
+    def _sharpe(returns):
+        std = returns.std()
+        return float(returns.mean() / std * np.sqrt(TRADING_DAYS)) if std > 0 else 0.0
 
     def calculate_metrics(self):
-        final_value = self.cash
-        total_return = final_value - self.initial_cash
-        return_pct = (total_return / self.initial_cash) * 100
-        days_held = (self.df.index[-1] - self.df.index[0]).days
-        years = days_held / 365.25
-        annualized_return = ((final_value / self.initial_cash) ** (1 / years) - 1) * 100 if years > 0 else 0
-        num_trades = len([t for t in self.trades if t['Type'] == 'BUY'])
+        df = self.df
+        equity = df["Equity"]
+        final_value = float(equity.iloc[-1])
+        days = (df.index[-1] - df.index[0]).days
+        years = days / 365.25
+
+        drawdown = equity / equity.cummax() - 1
+        trades_df = pd.DataFrame(self.trades)
+        wins = int((trades_df["pnl"] > 0).sum()) if not trades_df.empty else 0
+
         return {
-            'Initial Investment': self.initial_cash,
-            'Final Value': final_value,
-            'Total Return ($)': total_return,
-            'Total Return (%)': return_pct,
-            'Annualized Return (%)': annualized_return,
-            'Number of Trades': num_trades,
-            'Days Held': days_held,
-            'Buy & Hold Return (%)': ((self.df['Close'].iloc[-1] / self.df['Close'].iloc[0]) - 1) * 100,
+            "Final value ($)": final_value,
+            "Total return (%)": (final_value / self.initial_cash - 1) * 100,
+            "Annualized return (%)": ((final_value / self.initial_cash) ** (1 / years) - 1) * 100 if years > 0 else 0.0,
+            "Buy & hold return (%)": (df["Close"].iloc[-1] / df["Close"].iloc[0] - 1) * 100,
+            "Sharpe ratio": self._sharpe(equity.pct_change().dropna()),
+            "Buy & hold Sharpe": self._sharpe(df["Close"].pct_change().dropna()),
+            "Max drawdown (%)": float(drawdown.min() * 100),
+            "Round trips": len(self.trades),
+            "Win rate (%)": (wins / len(self.trades) * 100) if self.trades else 0.0,
         }
 
     def print_results(self):
-        metrics = self.calculate_metrics()
         print("\n" + "=" * 60)
         print("BACKTEST RESULTS")
         print("=" * 60)
-        print(f"Strategy: Mean Reversion (Bollinger Bands)")
-        print(f"Ticker: {self.ticker} | Period: {self.start_date} to {self.end_date}")
-        print(f"Parameters: SMA={self.sma_period}, Std Dev={self.std_dev}\n")
-        for key, value in metrics.items():
-            print(f"{key:<28} {value:>14,.2f}")
-        print("\nTRADE LOG")
-        print(pd.DataFrame(self.trades).to_string(index=False) if self.trades else "No trades executed.")
+        print(f"Ticker: {self.ticker} | {self.start_date} to {self.end_date}")
+        print(f"SMA={self.sma_period}, std={self.std_dev}, cost={self.cost_bps} bps per side\n")
+        for key, value in self.calculate_metrics().items():
+            print(f"{key:<26} {value:>12,.2f}")
+
+        if self.trades:
+            print("\nTRADES")
+            print(pd.DataFrame(self.trades).to_string(index=False))
+            os.makedirs("results", exist_ok=True)
+            pd.DataFrame(self.trades).to_csv("results/trades.csv", index=False)
+            print("\nSaved trade log to results/trades.csv")
+        else:
+            print("\nNo trades executed.")
 
 
 def main():
-    try:
-        bt = MeanReversionBacktester("SPY", "2022-01-01", "2024-01-01", 20, 2, 10000)
-        bt.fetch_data()
-        bt.calculate_indicators()
-        bt.generate_signals()
-        bt.backtest()
-        bt.print_results()
-    except Exception as e:
-        print(f"Error: {e}")
+    parser = argparse.ArgumentParser(description="Bollinger Band mean reversion backtester")
+    parser.add_argument("--ticker", default="SPY")
+    parser.add_argument("--start", default="2022-01-01")
+    parser.add_argument("--end", default="2024-01-01")
+    parser.add_argument("--sma", type=int, default=20)
+    parser.add_argument("--std", type=float, default=2.0)
+    parser.add_argument("--cost-bps", type=float, default=5)
+    args = parser.parse_args()
+
+    bt = MeanReversionBacktester(args.ticker, args.start, args.end,
+                                 args.sma, args.std, cost_bps=args.cost_bps)
+    bt.fetch_data()
+    bt.calculate_indicators()
+    bt.generate_signals()
+    bt.backtest()
+    bt.print_results()
 
 
 if __name__ == "__main__":
