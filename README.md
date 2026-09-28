@@ -4,37 +4,53 @@ Python experiments in backtesting and paper trading, built while learning algori
 
 ## Backtester: Bollinger Band mean reversion
 
-`backtest/mean_reversion_backtest.py` tests a simple mean reversion strategy on daily stock data from Yahoo Finance.
+`backtest/mean_reversion_backtest.py` tests a mean reversion strategy on daily stock data from Yahoo Finance.
 
 **Strategy**
-- Compute a 20-day simple moving average and bands 2 standard deviations above and below it.
-- Buy (whole shares, all available cash) when the close crosses below the lower band.
-- Sell the full position when the close crosses above the upper band.
-- Close any open position on the final day.
+- 20-day simple moving average with bands 2 standard deviations above and below.
+- Buy when the close crosses below the lower band; sell when it crosses above the upper band.
+- Long-only, one position at a time, whole shares, all available cash.
+- Signals are generated on the close and filled at the next day's open (no look-ahead).
+- A flat cost of 5 bps per side (configurable) approximates spread and slippage.
+- Any open position is closed at the final close.
+
+**Metrics:** total and annualized return, Sharpe ratio (daily equity returns, 252-day annualization, 0% risk-free rate), max drawdown (mark-to-market), round trips, and win rate. Every trade is saved to `results/trades.csv` (git-ignored).
 
 **Run it**
 
 ```bash
-pip install yfinance pandas
+pip install yfinance pandas numpy
 python3 backtest/mean_reversion_backtest.py
+python3 backtest/mean_reversion_backtest.py --ticker AAPL --cost-bps 10
 ```
 
-## Sample result
+Options: `--ticker`, `--start`, `--end`, `--sma`, `--std`, `--cost-bps`.
 
-| Ticker | Period | Strategy return | Buy & hold | Round trips |
-|--------|--------|-----------------|------------|-------------|
-| SPY | 2022-01-01 to 2024-01-01 | 6.91% | 2.65% | 5 |
+## Sample results (2022-01-01 to 2024-01-01)
+
+| Ticker | Cost/side | Strategy return | Buy & hold | Sharpe (strategy / B&H) | Max drawdown | Round trips | Win rate |
+|--------|-----------|-----------------|------------|-------------------------|--------------|-------------|----------|
+| SPY | 5 bps | 8.72% | 2.65% | 0.35 / 0.16 | -22.70% | 5 | 60% |
+| AAPL | 10 bps | 26.97% | 6.99% | 0.72 / 0.26 | -21.54% | 6 | 66.7% |
+
+## What the results show
+
+- The strategy beat buy-and-hold on both tickers, but with 5 to 6 trades this is an observation, not evidence of an edge.
+- The losing trades on both tickers were entered during the 2022 downtrend. The strategy buys dips with no trend filter.
+- Max drawdown (about 22%) is much larger than the worst closed trade (4.3% on SPY, 6.0% on AAPL), so most of the risk came from unrealized swings during long holds with no stop-loss.
 
 ## Limitations
 
-- Only 5 round trips, so this is far too small a sample to conclude the strategy has an edge.
-- No transaction costs, spreads, or slippage are modeled.
-- Parameters (20 days, 2 std) were not optimized or validated out of sample.
-- Results shift slightly between runs because Yahoo Finance re-adjusts historical prices for dividends.
+- Tiny sample; no statistical significance testing.
+- Parameters were not optimized or validated out of sample, and only two tickers and one two-year window were tested.
+- Costs are a flat assumption, not a model of spread, market impact, or taxes.
+- Sharpe uses a 0% risk-free rate and includes days spent in cash.
+- Yahoo Finance re-adjusts historical prices for dividends, so results drift slightly between runs.
 - Educational project, not financial advice.
 
 ## Next steps
 
-- Add Sharpe ratio and max drawdown.
-- Model transaction costs and slippage.
-- Add live paper trading bots using the Alpaca API.
+- Equity curve plot against buy-and-hold.
+- Trend filter and stop-loss.
+- Walk-forward (out-of-sample) testing.
+- Live paper trading bot using the Alpaca API in `live/`.
